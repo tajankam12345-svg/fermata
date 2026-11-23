@@ -1,11 +1,14 @@
-// Paints the day's orders as a grey picture with the member's own number and address all over it.
+// Paints the day's orders as a picture on the page's own dark ground, with the member's number and address
+// running across it on a slant.
 import { BIG, SMALL } from './glyphs.js'
 
 const WIDE = 720, EDGE = 28, ROW = 44
+const GROUND = [0x0d, 0x0e, 0x11], LIGHT = [0xf2, 0xf3, 0xf5]                  // a pixel is a step from the page's ground to near white
+const SLANT = -24 * Math.PI / 180, PITCH = 58, FAINT = 0.1                     // the mark: its angle, the distance between its lines, its strength
 const plain = s => String(s).replace(/[^\x20-\x7e]/g, '?')
 const span = (font, s) => [...plain(s)].reduce((n, ch) => n + font.of[ch][0], 0)
 
-function write(px, high, font, s, x, y, shade, strength = 1) {
+function write(px, wide, high, font, s, x, y, shade) {
   for (const ch of plain(s)) {
     const [w, bits] = font.of[ch]
     for (let r = 0; r < font.high; r++) {
@@ -13,12 +16,32 @@ function write(px, high, font, s, x, y, shade, strength = 1) {
       if (yy < 0 || yy >= high) continue
       for (let c = 0; c < w; c++) {
         const xx = x + c
-        if (xx < 0 || xx >= WIDE) continue
-        const a = parseInt(bits[r * w + c], 16) / 15 * strength
-        if (a) { const k = yy * WIDE + xx; px[k] = px[k] + (shade - px[k]) * a }
+        if (xx < 0 || xx >= wide) continue
+        const a = parseInt(bits[r * w + c], 16) / 15
+        if (a) { const k = yy * wide + xx; px[k] = px[k] + (shade - px[k]) * a }
       }
     }
     x += w
+  }
+}
+
+// The owner's words end to end with no gap, line after line on a slant, each line shifted against the one before.
+function mark(px, high, words) {
+  const unit = plain(words) + ' ', mw = span(SMALL, unit), mh = SMALL.high
+  const one = new Uint8Array(mw * mh)
+  write(one, mw, mh, SMALL, unit, 0, 0, 255)
+  const cos = Math.cos(SLANT), sin = Math.sin(SLANT), shift = Math.round(mw * 0.37)
+  for (let y = 0; y < high; y++) {
+    let u = y * sin, v = y * cos
+    for (let x = 0; x < WIDE; x++, u += cos, v -= sin) {
+      const line = Math.floor(v / PITCH), vv = v - line * PITCH
+      if (vv >= mh - 1) continue
+      let uu = (u + line * shift) % mw
+      if (uu < 0) uu += mw
+      const c = uu | 0, r = vv | 0, fc = uu - c, fr = vv - r, c2 = c + 1 === mw ? 0 : c + 1
+      const a = (one[r * mw + c] * (1 - fc) + one[r * mw + c2] * fc) * (1 - fr) + (one[(r + 1) * mw + c] * (1 - fc) + one[(r + 1) * mw + c2] * fc) * fr
+      if (a > 8) { const k = y * WIDE + x; px[k] = px[k] + (255 - px[k]) * (a / 255) * FAINT }
+    }
   }
 }
 
@@ -39,36 +62,37 @@ async function png(px, high) {
   for (let r = 0; r < high; r++) raw.set(px.subarray(r * WIDE, (r + 1) * WIDE), r * (WIDE + 1) + 1)
   const packed = new Uint8Array(await new Response(new Blob([raw]).stream().pipeThrough(new CompressionStream('deflate'))).arrayBuffer())
   const head = new Uint8Array(13), view = new DataView(head.buffer)
-  view.setUint32(0, WIDE); view.setUint32(4, high); head[8] = 8                 // eight bits of grey, nothing else
-  const parts = [new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', head), chunk('IDAT', packed), chunk('IEND', new Uint8Array(0))]
+  view.setUint32(0, WIDE); view.setUint32(4, high); head[8] = 8; head[9] = 3    // one byte a pixel, looked up in the colours below
+  const colours = new Uint8Array(768)
+  for (let k = 0; k < 256; k++) for (let c = 0; c < 3; c++) colours[k * 3 + c] = Math.round(GROUND[c] + (LIGHT[c] - GROUND[c]) * k / 255)
+  const parts = [new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', head), chunk('PLTE', colours), chunk('IDAT', packed), chunk('IEND', new Uint8Array(0))]
   const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0))
   let at = 0
   for (const p of parts) { out.set(p, at); at += p.length }
   return out
 }
 
-// body: { buy: [[symbol, percent]], sell: [...], hold: [...] }; mark: the words that say whose picture this is
-export async function picture(title, body, mark) {
+// body: { buy: [[symbol, percent]], sell: [...], hold: [...] }; words: whose picture this is
+export async function picture(title, body, words) {
   const parts = [['BUY', body.buy || []], ['SELL', body.sell || []], ['HOLD', body.hold || []]].filter(p => p[1].length)
   const lines = parts.reduce((n, p) => n + 1 + Math.ceil(p[1].length / 2), 0)
   const high = EDGE * 2 + 52 + Math.max(lines, 3) * ROW
-  const px = new Uint8Array(WIDE * high).fill(18)
-  write(px, high, BIG, title, EDGE, EDGE, 235)
+  const px = new Uint8Array(WIDE * high)
+  mark(px, high, words)                                                          // under the letters, so they stay sharp
+  write(px, WIDE, high, BIG, title, EDGE, EDGE, 250)
   let y = EDGE + 52
-  if (!parts.length) write(px, high, SMALL, 'NO ORDERS', EDGE, y + 12, 150)
+  if (!parts.length) write(px, WIDE, high, SMALL, 'NO ORDERS', EDGE, y + 12, 150)
   for (const [name, rows] of parts) {
-    write(px, high, SMALL, name + '  ' + rows.length, EDGE, y + 16, 150)
-    for (let x = EDGE; x < WIDE - EDGE; x++) px[(y + ROW - 6) * WIDE + x] = 48
+    write(px, WIDE, high, SMALL, name + '  ' + rows.length, EDGE, y + 16, 150)
+    for (let x = EDGE; x < WIDE - EDGE; x++) px[(y + ROW - 6) * WIDE + x] = 44
     y += ROW
     rows.forEach(([symbol, percent], k) => {
       const left = EDGE + (k % 2) * (WIDE / 2 - EDGE / 2), top = y + Math.floor(k / 2) * ROW
       const share = Number(percent).toFixed(1) + '%'
-      write(px, high, BIG, symbol, left, top + 4, 240)
-      write(px, high, BIG, share, left + WIDE / 2 - EDGE * 2 - span(BIG, share), top + 4, 170)
+      write(px, WIDE, high, BIG, symbol, left, top + 4, 255)
+      write(px, WIDE, high, BIG, share, left + WIDE / 2 - EDGE * 2 - span(BIG, share), top + 4, 185)
     })
     y += Math.ceil(rows.length / 2) * ROW
   }
-  const step = span(SMALL, mark) + 46                                            // the owner's mark, over everything, so no crop is clean
-  for (let r = 0, yy = 6; yy < high; r++, yy += 34) for (let x = -((r * 97) % step); x < WIDE; x += step) write(px, high, SMALL, mark, x, yy, 255, 0.2)
   return png(px, high)
 }
