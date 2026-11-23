@@ -8,6 +8,7 @@ const TABLES = [
   'CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, member INTEGER NOT NULL, device TEXT NOT NULL, made INTEGER NOT NULL)',
   'CREATE TABLE IF NOT EXISTS devices (member INTEGER NOT NULL, device TEXT NOT NULL, month TEXT NOT NULL, PRIMARY KEY (member, device, month))',
   'CREATE TABLE IF NOT EXISTS tries (key TEXT NOT NULL, at INTEGER NOT NULL)',
+  'CREATE TABLE IF NOT EXISTS spent (mark TEXT PRIMARY KEY, at INTEGER NOT NULL)',
   'CREATE TABLE IF NOT EXISTS subs (member INTEGER PRIMARY KEY, plan TEXT NOT NULL, period TEXT NOT NULL, started INTEGER NOT NULL, since INTEGER NOT NULL, ends INTEGER NOT NULL, paid INTEGER NOT NULL, state TEXT NOT NULL)',
   'CREATE TABLE IF NOT EXISTS payments (id INTEGER PRIMARY KEY AUTOINCREMENT, member INTEGER NOT NULL, plan TEXT NOT NULL, period TEXT NOT NULL, amount INTEGER NOT NULL, coupon INTEGER, at INTEGER NOT NULL)',
   'CREATE TABLE IF NOT EXISTS coupons (id INTEGER PRIMARY KEY AUTOINCREMENT, member INTEGER NOT NULL, why TEXT NOT NULL, made INTEGER NOT NULL, used INTEGER)',
@@ -82,11 +83,14 @@ async function who(db, request) {
 const day = t => new Date(t + 9 * 3600e3).toISOString().slice(0, 10)
 const before = env => !env.LAUNCH || Date.now() < Date.parse(env.LAUNCH)        // subscriptions are not open yet
 
-// The day's orders go up at nine in the morning in Korea, which is midnight UTC, so a service day is a UTC day.
-// Paid before nine in the evening: the subscription starts with that day's nine o'clock. Paid later: with the next day's.
+// The day's orders go up at eight in the morning in Korea, and a service day runs from one eight o'clock to the next.
+const EIGHT = 3600e3                                                            // eight in Korea is an hour before midnight UTC
+const eight = t => Math.floor((t + EIGHT) / DAY) * DAY - EIGHT                 // the last eight o'clock at or before t
+const shown = () => new Date(eight(Date.now()) + 9 * 3600e3).toISOString().slice(0, 10)      // the day whose orders are out
+// Paid before eight in the evening: the subscription starts with that day's eight o'clock in the morning. Paid later: with the next day's.
 function opens(at) {
-  const k = new Date(at + 9 * 3600e3), nine = Date.UTC(k.getUTCFullYear(), k.getUTCMonth(), k.getUTCDate())
-  return k.getUTCHours() >= 21 ? nine + DAY : nine
+  const k = new Date(at + 9 * 3600e3), start = Date.UTC(k.getUTCFullYear(), k.getUTCMonth(), k.getUTCDate()) - EIGHT
+  return k.getUTCHours() >= 20 ? start + DAY : start
 }
 const coupon = (db, member) => db.prepare('SELECT id FROM coupons WHERE member = ? AND used IS NULL').bind(member).first()
 const due = (plan, period, off) => period === 'gift' ? 0 : period === 'month' && off ? Math.round(PRICE[plan].month * (1 - OFF)) : PRICE[plan][period]
@@ -95,6 +99,8 @@ const live = (db, member) => db.prepare("SELECT * FROM subs WHERE member = ? AND
 // One coupon for an account, ever: a member who has had one, spent or not, gets nothing more.
 async function grant(db, member, why, at) {
   if (await db.prepare('SELECT 1 FROM coupons WHERE member = ?').bind(member).first()) return
+  const m = await db.prepare('SELECT phone FROM members WHERE id = ?').bind(member).first()      // a number that left with a coupon does not earn another by joining again
+  if (!m || await db.prepare('SELECT 1 FROM spent WHERE mark = ? AND at > ?').bind(await sha('coupon:' + m.phone), at - 365 * DAY).first()) return
   await db.prepare('INSERT INTO coupons (member, why, made) VALUES (?, ?, ?)').bind(member, why, at).run()
 }
 
@@ -123,7 +129,7 @@ async function pay(db, member, plan, period, at = Date.now()) {
   return amount
 }
 
-// Leaving: the unused days come back. A day is used once its nine o'clock has passed, so leaving before the first one returns everything.
+// Leaving: the unused days come back. A day is used once its eight o'clock has passed, so leaving before the first one returns everything.
 // A year bought at the yearly price is charged the monthly price for the days used.
 async function leave(db, member, at = Date.now()) {
   const s = await db.prepare("SELECT * FROM subs WHERE member = ? AND state = 'on'").bind(member).first()
@@ -188,7 +194,14 @@ async function begin(env, db, got, kind) {
     db.prepare('INSERT INTO pending (token, kind, phone, email, salt, hash, text, made, invited_by, news, place) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
       .bind(token, kind, phone, email, salt, await lock(password, salt), text, Date.now(), invited, got?.news === true ? 1 : 0, String(got?.where || '').slice(0, 20)),
   ])
-  return reply({ ok: true, token, text, to: TO, minutes: WAIT })
+  let qr = null                                                                  // for a visitor at a desk: a picture the phone reads to open the text, written
+  if (env.OCTOMO_KEY) {
+    try {
+      const r = await fetch(OCTOMO.replace('/exists', '/qr-code'), { method: 'POST', headers: { accept: 'application/json', 'content-type': 'application/json', authorization: 'Octomo ' + env.OCTOMO_KEY }, body: JSON.stringify({ text, width: 320 }) })
+      if (r.ok) qr = (await r.json()).qrCode || null
+    } catch (e) {}
+  }
+  return reply({ ok: true, token, text, to: TO, minutes: WAIT, qr })
 }
 
 // Step two: the text has been sent, so look it up and finish.
@@ -229,6 +242,25 @@ async function login(env, db, request, got) {
   return reply({ ok: true, me: await card(db, m, env) }, 200, set)
 }
 
+// Leaving for good, from the account page, with the password once more.
+async function quit(db, request, got) {
+  const m = await who(db, request)
+  if (!m) return reply({ ok: false, why: 'login' }, 401)
+  if (await crowded(db, 'quit:' + m.id, 5, 15)) return reply({ ok: false, why: 'often' }, 429)
+  if (await lock(String(got?.password || '').slice(0, 100), m.salt) !== m.hash) return reply({ ok: false, why: 'wrong' }, 401)
+  const s = await live(db, m.id)
+  if (s && s.paid > 0) return reply({ ok: false, why: 'sub' }, 409)              // a paid subscription is ended first, so its refund is settled
+  const had = await db.prepare('SELECT 1 FROM coupons WHERE member = ?').bind(m.id).first()
+  await db.batch([
+    ...(had ? [db.prepare('INSERT INTO spent (mark, at) VALUES (?, ?) ON CONFLICT (mark) DO UPDATE SET at = excluded.at').bind(await sha('coupon:' + m.phone), Date.now())] : []),
+    db.prepare('DELETE FROM spent WHERE at < ?').bind(Date.now() - 365 * DAY),
+    ...['sessions', 'devices', 'coupons', 'oaths', 'subs', 'views'].map(t => db.prepare(`DELETE FROM ${t} WHERE member = ?`).bind(m.id)),
+    db.prepare('DELETE FROM pending WHERE phone = ?').bind(m.phone),
+    db.prepare('DELETE FROM members WHERE id = ?').bind(m.id),
+  ])
+  return reply({ ok: true }, 200, [bake('fs', '', 0)])
+}
+
 // What a subscriber may open today.
 async function orders(db, request, url, kind) {
   const m = await who(db, request)
@@ -236,7 +268,7 @@ async function orders(db, request, url, kind) {
   const s = await live(db, m.id)
   if (!s || s.since > Date.now()) return reply({ ok: false, why: 'plan', from: s ? day(s.since) : null }, 402)
   const sworn = !!await db.prepare('SELECT 1 FROM oaths WHERE member = ?').bind(m.id).first()
-  const last = await db.prepare('SELECT MAX(day) AS day FROM feed WHERE day <= ?').bind(new Date().toISOString().slice(0, 10)).first()      // nothing shows before its nine o'clock
+  const last = await db.prepare('SELECT MAX(day) AS day FROM feed WHERE day <= ?').bind(shown()).first()      // nothing shows before its eight o'clock
   const rows = last.day ? (await db.prepare('SELECT model FROM feed WHERE day = ?').bind(last.day).all()).results.map(r => r.model) : []
   const models = SEES[s.plan].filter(n => rows.includes(n))
   if (kind === 'list') return reply({ ok: true, day: last.day, models: models.map(n => ({ id: n, name: NAMES[n] })), sworn, mark: mask(m.phone) })
@@ -273,7 +305,7 @@ async function gift(env, db, request) {
   if (!PRICE[plan] || !(days >= 0 && days <= 3660)) return reply({ ok: false }, 400)
   const m = await db.prepare('SELECT id FROM members WHERE phone = ?').bind(phone).first()
   if (!m) return reply({ ok: false, why: 'unknown' }, 404)
-  const nine = Math.floor(Date.now() / DAY) * DAY                                // the last nine o'clock that has passed: open at once
+  const nine = eight(Date.now())                                                 // the last eight o'clock that has passed: open at once
   await db.prepare("INSERT INTO subs (member, plan, period, started, since, ends, paid, state) VALUES (?, ?, 'gift', ?, ?, ?, 0, ?) ON CONFLICT (member) DO UPDATE SET plan = excluded.plan, period = 'gift', started = excluded.started, since = excluded.since, ends = excluded.ends, paid = 0, state = excluded.state")
     .bind(m.id, plan, nine, nine, nine + days * DAY, days ? 'on' : 'off').run()
   return reply({ ok: true, plan, until: day(nine + days * DAY) })
@@ -315,6 +347,7 @@ export default {
       if (path === '/api/reset') return await begin(env, db, got, 'reset')
       if (path === '/api/check') return await finish(env, db, request, got)
       if (path === '/api/login') return await login(env, db, request, got)
+      if (path === '/api/quit') return await quit(db, request, got)
       if (path === '/api/oath') {
         const m = await who(db, request)
         if (!m) return reply({ ok: false, why: 'login' }, 401)
