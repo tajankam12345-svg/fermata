@@ -1,2 +1,4 @@
 data.json
 history/
+.dev.vars
+.wrangler/
