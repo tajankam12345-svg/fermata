@@ -89,7 +89,7 @@ function opens(at) {
   return k.getUTCHours() >= 21 ? nine + DAY : nine
 }
 const coupon = (db, member) => db.prepare('SELECT id FROM coupons WHERE member = ? AND used IS NULL').bind(member).first()
-const due = (plan, period, off) => period === 'month' && off ? Math.round(PRICE[plan].month * (1 - OFF)) : PRICE[plan][period]
+const due = (plan, period, off) => period === 'gift' ? 0 : period === 'month' && off ? Math.round(PRICE[plan].month * (1 - OFF)) : PRICE[plan][period]
 const live = (db, member) => db.prepare("SELECT * FROM subs WHERE member = ? AND state = 'on' AND ends > ?").bind(member, Date.now()).first()      // paid for; it may not have started yet
 
 // One coupon for an account, ever: a member who has had one, spent or not, gets nothing more.
@@ -263,6 +263,22 @@ async function feed(env, db, request) {
   return reply({ ok: true })
 }
 
+// The owner opens a subscription for a member without a payment: for the owner's own account, a reviewer, a guest.
+// It is open at once, costs nothing, and takes no coupon. Zero days closes it.
+async function gift(env, db, request) {
+  if (!env.FEED_KEY) return reply({ ok: false }, 503)
+  if (request.headers.get('authorization') !== 'Feed ' + env.FEED_KEY) return reply({ ok: false }, 401)
+  const got = await request.json().catch(() => null)
+  const phone = String(got?.phone || '').replace(/\D/g, ''), plan = String(got?.plan || 'all'), days = Number(got?.days ?? 30)
+  if (!PRICE[plan] || !(days >= 0 && days <= 3660)) return reply({ ok: false }, 400)
+  const m = await db.prepare('SELECT id FROM members WHERE phone = ?').bind(phone).first()
+  if (!m) return reply({ ok: false, why: 'unknown' }, 404)
+  const nine = Math.floor(Date.now() / DAY) * DAY                                // the last nine o'clock that has passed: open at once
+  await db.prepare("INSERT INTO subs (member, plan, period, started, since, ends, paid, state) VALUES (?, ?, 'gift', ?, ?, ?, 0, ?) ON CONFLICT (member) DO UPDATE SET plan = excluded.plan, period = 'gift', started = excluded.started, since = excluded.since, ends = excluded.ends, paid = 0, state = excluded.state")
+    .bind(m.id, plan, nine, nine, nine + days * DAY, days ? 'on' : 'off').run()
+  return reply({ ok: true, plan, until: day(nine + days * DAY) })
+}
+
 // Stand-ins for the payment provider, on a local run only.
 async function pretend(db, request, path, got) {
   const m = await who(db, request)
@@ -291,6 +307,7 @@ export default {
       const origin = request.headers.get('origin')
       if (origin && origin !== url.origin) return reply({ ok: false }, 403)
       if (path === '/api/feed') return await feed(env, db, request)
+      if (path === '/api/gift') return await gift(env, db, request)
       if (Number(request.headers.get('content-length') || 0) > 2000) return reply({ ok: false }, 413)
       const got = await request.json().catch(() => null)
       if (path === '/api/waitlist') return await waitlist(db, got)
