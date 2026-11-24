@@ -184,7 +184,7 @@ async function begin(env, db, got, kind) {
   if (got?.site) return reply({ ok: false, why: 'phone' }, 400)
   const phone = String(got?.phone || '').replace(/\D/g, ''), email = String(got?.email || '').trim().toLowerCase(), password = String(got?.password || '')
   if (!PHONE.test(phone)) return reply({ ok: false, why: 'phone' }, 400)
-  if (password.length < 8 || password.length > 100) return reply({ ok: false, why: 'password' }, 400)
+  if (password.length < 9 || password.length > 100 || !/[A-Za-z]/.test(password) || !/\d/.test(password) || !/[^A-Za-z0-9]/.test(password)) return reply({ ok: false, why: 'password' }, 400)      // letters, digits and a sign, nine or more
   const member = await db.prepare('SELECT id FROM members WHERE phone = ?').bind(phone).first()
   let invited = null
   if (kind === 'join') {
