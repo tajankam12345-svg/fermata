@@ -22,8 +22,9 @@ const DEVICES = 3                 // devices one account may sign in from in a c
 const WAIT = 10                   // minutes a text may take to arrive
 const CHECKS = 8                  // lookups one sign-up may spend (the lookup service counts every call)
 const STAY = 30 * 86400           // seconds a sign-in lasts
-const PRICE = { all: { month: 19900, year: 199000 }, lyric: { month: 9900, year: 99000 } }
-const SEES = { all: ['LVX-B01', 'LVX-WH1', 'LVX-061', 'LVX-P32'], lyric: ['LVX-061'] }
+const PRICE = { all: { month: 19900, year: 199000 } }      // one plan
+const FIRST = 9900                // an account's first month, once for a phone number
+const SEES = { all: ['LVX-B01', 'LVX-WH1', 'LVX-061', 'LVX-P32'], lyric: ['LVX-061'] }      // lyric: not sold any more
 const NAMES = { 'LVX-B01': 'Ode 2.2', 'LVX-WH1': 'Ode Encore 2.2', 'LVX-061': 'Lyric 2.2', 'LVX-P32': 'Rhapsody 2.2' }
 const OFF = 0.2                   // what a coupon takes off one monthly payment
 const DAY = 86400e3
@@ -92,8 +93,14 @@ function opens(at) {
   const k = new Date(at + 9 * 3600e3), start = Date.UTC(k.getUTCFullYear(), k.getUTCMonth(), k.getUTCDate()) - EIGHT
   return k.getUTCHours() >= 20 ? start + DAY : start
 }
-const coupon = (db, member) => db.prepare('SELECT id FROM coupons WHERE member = ? AND used IS NULL').bind(member).first()
-const due = (plan, period, off) => period === 'gift' ? 0 : period === 'month' && off ? Math.round(PRICE[plan].month * (1 - OFF)) : PRICE[plan][period]
+const coupon = (db, member) => db.prepare("SELECT id FROM coupons WHERE member = ? AND used IS NULL AND why != 'early'").bind(member).first()      // 'early': the coupons once given for joining before the launch, replaced by the first month's price
+const due = (plan, period, off, first) => period === 'gift' ? 0 : period === 'month' && first ? FIRST : period === 'month' && off ? Math.round((PRICE[plan] || PRICE.all).month * (1 - OFF)) : (PRICE[plan] || PRICE.all)[period]
+// The first month's price: for an account that has never paid, whose number has not left after paying within a year.
+async function fresh(db, member, at = Date.now()) {
+  if (await db.prepare('SELECT 1 FROM payments WHERE member = ?').bind(member).first()) return false
+  const m = await db.prepare('SELECT phone FROM members WHERE id = ?').bind(member).first()
+  return !!m && !await db.prepare('SELECT 1 FROM spent WHERE mark = ? AND at > ?').bind(await sha('first:' + m.phone), at - 365 * DAY).first()
+}
 const live = (db, member) => db.prepare("SELECT * FROM subs WHERE member = ? AND state = 'on' AND ends > ?").bind(member, Date.now()).first()      // paid for; it may not have started yet
 
 // One coupon for an account, ever: a member who has had one, spent or not, gets nothing more.
@@ -117,7 +124,8 @@ async function ripen(db, member, at = Date.now()) {
 // Every payment comes through here, whoever takes the money: the amount, the coupon spent, the days bought.
 async function pay(db, member, plan, period, at = Date.now()) {
   if (!PRICE[plan]?.[period]) throw new Error('plan')
-  const held = period === 'month' ? await coupon(db, member) : null, amount = due(plan, period, held)
+  const first = period === 'month' && await fresh(db, member, at)
+  const held = period === 'month' && !first ? await coupon(db, member) : null, amount = due(plan, period, held, first)      // the coupon waits for a month at the full price
   const long = (period === 'year' ? 365 : 30) * DAY, had = await db.prepare('SELECT * FROM subs WHERE member = ?').bind(member).first()
   const going = had && had.state === 'on' && had.ends > at
   await db.batch([
@@ -135,7 +143,7 @@ async function leave(db, member, at = Date.now()) {
   const s = await db.prepare("SELECT * FROM subs WHERE member = ? AND state = 'on'").bind(member).first()
   if (!s || s.ends <= at) return 0
   const all = Math.round((s.ends - s.started) / DAY), used = at < s.started ? 0 : Math.min(all, Math.floor((at - s.started) / DAY) + 1)
-  const back = s.period === 'year' ? Math.max(0, s.paid - Math.round(PRICE[s.plan].month * 12 * used / 365)) : Math.max(0, Math.round(s.paid * (all - used) / all))
+  const back = s.period === 'year' ? Math.max(0, s.paid - Math.round((PRICE[s.plan] || PRICE.all).month * 12 * used / 365)) : Math.max(0, Math.round(s.paid * (all - used) / all))
   await db.prepare("UPDATE subs SET state = 'off', ends = ? WHERE member = ?").bind(at, member).run()
   return back
 }
@@ -144,7 +152,7 @@ async function card(db, m, env) {
   await ripen(db, m.id)
   const invited = await db.prepare('SELECT COUNT(*) AS n FROM members WHERE invited_by = ?').bind(m.id).first()
   const s = await live(db, m.id), held = !!await coupon(db, m.id)
-  return { early: before(env), phone: mask(m.phone), email: m.email, code: m.code, invited: invited.n, coupon: held, off: OFF, sub: s ? { plan: s.plan, period: s.period, from: s.since > Date.now() ? day(s.since) : null, ends: day(s.ends), next: due(s.plan, s.period, held) } : null, joined: new Date(Date.parse(m.joined) + 9 * 3600e3).toISOString().slice(0, 10) }
+  return { early: before(env), first: await fresh(db, m.id) ? FIRST : 0, month: PRICE.all.month, phone: mask(m.phone), email: m.email, code: m.code, invited: invited.n, coupon: held, off: OFF, sub: s ? { plan: s.plan, period: s.period, from: s.since > Date.now() ? day(s.since) : null, ends: day(s.ends), next: due(s.plan, s.period, held) } : null, joined: new Date(Date.parse(m.joined) + 9 * 3600e3).toISOString().slice(0, 10) }
 }
 
 // Sign this device in and every other device out. Null when the month's devices are used up.
@@ -220,7 +228,6 @@ async function finish(env, db, request, got) {
       else if (await db.prepare('SELECT id FROM members WHERE phone = ?').bind(p.phone).first()) return reply({ ok: false, why: 'taken' }, 409)
     }
     if (id == null) return reply({ ok: false }, 500)
-    if (before(env)) await grant(db, id, 'early', Date.now())                    // before the launch, joining itself earns the coupon
   } else {
     id = (await db.prepare('SELECT id FROM members WHERE phone = ?').bind(p.phone).first()).id
     await db.prepare('UPDATE members SET salt = ?, hash = ? WHERE id = ?').bind(p.salt, p.hash, id).run()
@@ -250,9 +257,10 @@ async function quit(db, request, got) {
   if (await lock(String(got?.password || '').slice(0, 100), m.salt) !== m.hash) return reply({ ok: false, why: 'wrong' }, 401)
   const s = await live(db, m.id)
   if (s && s.paid > 0) return reply({ ok: false, why: 'sub' }, 409)              // a paid subscription is ended first, so its refund is settled
-  const had = await db.prepare('SELECT 1 FROM coupons WHERE member = ?').bind(m.id).first()
+  const had = await db.prepare('SELECT 1 FROM coupons WHERE member = ?').bind(m.id).first(), paid = await db.prepare('SELECT 1 FROM payments WHERE member = ?').bind(m.id).first()
   await db.batch([
     ...(had ? [db.prepare('INSERT INTO spent (mark, at) VALUES (?, ?) ON CONFLICT (mark) DO UPDATE SET at = excluded.at').bind(await sha('coupon:' + m.phone), Date.now())] : []),
+    ...(paid ? [db.prepare('INSERT INTO spent (mark, at) VALUES (?, ?) ON CONFLICT (mark) DO UPDATE SET at = excluded.at').bind(await sha('first:' + m.phone), Date.now())] : []),
     db.prepare('DELETE FROM spent WHERE at < ?').bind(Date.now() - 365 * DAY),
     ...['sessions', 'devices', 'coupons', 'oaths', 'subs', 'views'].map(t => db.prepare(`DELETE FROM ${t} WHERE member = ?`).bind(m.id)),
     db.prepare('DELETE FROM pending WHERE phone = ?').bind(m.phone),
