@@ -5,11 +5,11 @@ import { BIG, SMALL } from './glyphs.js'
 const WIDE = 720, EDGE = 28, ROW = 44
 const GROUND = [0x0d, 0x0e, 0x11], LIGHT = [0xf2, 0xf3, 0xf5]                  // a pixel is a step from the page's ground to near white
 const SLANT = -24 * Math.PI / 180, PITCH = 58, FAINT = 0.1                     // the mark: its angle, the distance between its lines, its strength
-const plain = s => String(s).replace(/[^\x20-\x7e]/g, '?')
-const span = (font, s) => [...plain(s)].reduce((n, ch) => n + font.of[ch][0], 0)
+const plain = (font, s) => [...String(s)].map(ch => font.of[ch] ? ch : '?')      // only the letters the font has
+const span = (font, s) => plain(font, s).reduce((n, ch) => n + font.of[ch][0], 0)
 
 function write(px, wide, high, font, s, x, y, shade) {
-  for (const ch of plain(s)) {
+  for (const ch of plain(font, s)) {
     const [w, bits] = font.of[ch]
     for (let r = 0; r < font.high; r++) {
       const yy = y + r
@@ -27,7 +27,7 @@ function write(px, wide, high, font, s, x, y, shade) {
 
 // The owner's words end to end with no gap, line after line on a slant, each line shifted against the one before.
 function mark(px, high, words) {
-  const unit = plain(words) + ' ', mw = span(SMALL, unit), mh = SMALL.high
+  const unit = plain(SMALL, words).join('') + ' ', mw = span(SMALL, unit), mh = SMALL.high
   const one = new Uint8Array(mw * mh)
   write(one, mw, mh, SMALL, unit, 0, 0, 255)
   const cos = Math.cos(SLANT), sin = Math.sin(SLANT), shift = Math.round(mw * 0.37)
@@ -72,25 +72,35 @@ async function png(px, high) {
   return out
 }
 
-// body: { buy: [[symbol, percent]], sell: [...], hold: [...] }; words: whose picture this is
-export async function picture(title, body, words) {
-  const parts = [['BUY', body.buy || []], ['SELL', body.sell || []], ['HOLD', body.hold || []]].filter(p => p[1].length)
+const commas = n => String(n).replace(/\B(?=(\d{3})+$)/g, ',')
+const dollars = n => { const c = Math.round(n * 100); return commas(Math.floor(c / 100)) + '.' + String(c % 100).padStart(2, '0') }      // to the cent, as fractional orders are placed
+
+// body: { buy: [[symbol, percent]], sell: [[symbol, percent, percent of the holding]], hold: [...] }; words: whose picture this is;
+// base: an amount in dollars to show every share of, beside the percentage (0: percentages only)
+export async function picture(title, body, words, base = 0) {
+  const parts = [['살 종목', body.buy || []], ['팔 종목', body.sell || []], ['주문 뒤 보유', body.hold || []]].filter(p => p[1].length)
   const lines = parts.reduce((n, p) => n + 1 + Math.ceil(p[1].length / 2), 0)
   const high = EDGE * 2 + 52 + Math.max(lines, 3) * ROW
   const px = new Uint8Array(WIDE * high)
   mark(px, high, words)                                                          // under the letters, so they stay sharp
   write(px, WIDE, high, BIG, title, EDGE, EDGE, 250)
+  if (base) { const per = '기준 금액 $' + commas(base); write(px, WIDE, high, SMALL, per, WIDE - EDGE - span(SMALL, per), EDGE + 10, 150) }
   let y = EDGE + 52
-  if (!parts.length) write(px, WIDE, high, SMALL, 'NO ORDERS', EDGE, y + 12, 150)
+  if (!parts.length) write(px, WIDE, high, SMALL, '주문 없음', EDGE, y + 12, 150)
   for (const [name, rows] of parts) {
     write(px, WIDE, high, SMALL, name + '  ' + rows.length, EDGE, y + 16, 150)
     for (let x = EDGE; x < WIDE - EDGE; x++) px[(y + ROW - 6) * WIDE + x] = 44
     y += ROW
-    rows.forEach(([symbol, percent], k) => {
+    rows.forEach(([symbol, percent, portion], k) => {
       const left = EDGE + (k % 2) * (WIDE / 2 - EDGE / 2), top = y + Math.floor(k / 2) * ROW
       const share = Number(percent).toFixed(1) + '%'
       write(px, WIDE, high, BIG, symbol, left, top + 4, 255)
-      write(px, WIDE, high, BIG, share, left + WIDE / 2 - EDGE * 2 - span(BIG, share), top + 4, 185)
+      const right = left + WIDE / 2 - EDGE * 2
+      if (portion) { const say = portion >= 100 ? '전량' : '보유분 ' + portion + '%'; return write(px, WIDE, high, SMALL, say, right - span(SMALL, say), top + 14, 215) }      // a sale: the part of what is held
+      if (!base) return write(px, WIDE, high, BIG, share, right - span(BIG, share), top + 4, 185)
+      const sum = dollars(base * percent / 100), font = span(BIG, sum) <= 125 ? BIG : SMALL
+      write(px, WIDE, high, SMALL, share, right - 135 - span(SMALL, share), top + 14, 140)
+      write(px, WIDE, high, font, sum, right - span(font, sum), top + (font === BIG ? 4 : 14), base * percent / 100 < 1 ? 110 : 215)      // under a dollar: too small to order
     })
     y += Math.ceil(rows.length / 2) * ROW
   }

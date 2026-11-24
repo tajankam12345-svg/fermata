@@ -278,7 +278,8 @@ async function orders(db, request, url, kind) {
   const row = await db.prepare('SELECT body FROM feed WHERE day = ? AND model = ?').bind(last.day, model).first()
   await db.prepare('INSERT INTO views (member, day, model, device, at) VALUES (?, ?, ?, ?, ?)').bind(m.id, last.day, model, cookies(request).fd || null, Date.now()).run()
   const mark = m.phone.replace(/(\d{3})(\d{4})(\d{4})/, '$1-$2-$3') + ' ' + m.email
-  return new Response(await picture(NAMES[model] + '   ' + last.day, JSON.parse(row.body), mark), { headers: { 'content-type': 'image/png', 'cache-control': 'private, no-store' } })
+  const base = Math.min(Math.max(Math.floor(Number(request.headers.get('x-base')) || 0), 0), 1e9)       // dollars; used for this picture only, kept nowhere
+  return new Response(await picture(NAMES[model] + '   ' + last.day, JSON.parse(row.body), mark, base), { headers: { 'content-type': 'image/png', 'cache-control': 'private, no-store' } })
 }
 
 // The day's orders arrive from the machine that makes them, with its own key.
