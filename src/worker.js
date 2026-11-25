@@ -420,7 +420,7 @@ async function orders(db, request, url, kind) {
   const last = await db.prepare('SELECT MAX(day) AS day FROM feed WHERE day <= ?').bind(shown()).first()      // nothing shows before its eight o'clock
   const rows = last.day ? (await db.prepare('SELECT model FROM feed WHERE day = ?').bind(last.day).all()).results.map(r => r.model) : []
   const models = SEES[s.plan].filter(n => rows.includes(n))
-  if (kind === 'list') return reply({ ok: true, day: last.day, models: models.map(n => ({ id: n, name: NAMES[n] })), sworn, mark: mask(m.phone) })
+  if (kind === 'list') return reply({ ok: true, first: Date.now() < s.since + DAY, since: day(s.since), day: last.day, models: models.map(n => ({ id: n, name: NAMES[n] })), sworn, mark: mask(m.phone) })
   if (!sworn) return reply({ ok: false, why: 'oath' }, 403)
   const model = url.searchParams.get('model')
   if (!models.includes(model)) return reply({ ok: false }, 404)
