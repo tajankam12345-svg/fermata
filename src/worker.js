@@ -521,7 +521,8 @@ export default {
         const m = await who(db, request)
         if (!m) return reply({ ok: false, why: 'login' }, 401)
         const got = await grant(db, m.id, 'practice', Date.now())
-        return reply({ ok: true, got, has: got || !!await db.prepare("SELECT 1 FROM coupons WHERE member = ? AND why = 'practice'").bind(m.id).first() })
+        const kept = got ? null : await db.prepare("SELECT used FROM coupons WHERE member = ? AND why = 'practice'").bind(m.id).first()
+        return reply({ ok: true, got, has: got || !!kept, used: !!(kept && kept.used) })
       }
       if (path === '/api/plan') return await plan(db, request, got)
       if (path === '/api/phone') return await renumber(env, db, request, got)
