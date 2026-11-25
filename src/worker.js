@@ -15,9 +15,19 @@ const TABLES = [
   'CREATE TABLE IF NOT EXISTS rewards (invitee INTEGER PRIMARY KEY, made INTEGER NOT NULL)',
   'CREATE TABLE IF NOT EXISTS feed (day TEXT NOT NULL, model TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY (day, model))',
   'CREATE TABLE IF NOT EXISTS oaths (member INTEGER PRIMARY KEY, at INTEGER NOT NULL)',
+  'CREATE TABLE IF NOT EXISTS refunds (id INTEGER PRIMARY KEY AUTOINCREMENT, member INTEGER NOT NULL, amount INTEGER NOT NULL, at INTEGER NOT NULL, paid INTEGER)',
   'CREATE TABLE IF NOT EXISTS views (member INTEGER NOT NULL, day TEXT NOT NULL, model TEXT NOT NULL, device TEXT, at INTEGER NOT NULL)',
 ]
 const OCTOMO = 'https://api.octoverse.kr/octomo/v1/public/message/exists', TO = '16663538'
+// Columns added after the first tables were made. renew: 0 when the member has said the subscription ends with what is paid for.
+// next: the period the next payment buys when it is not the same again ('year' after a month).
+const GROWN = ['ALTER TABLE subs ADD COLUMN renew INTEGER NOT NULL DEFAULT 1', 'ALTER TABLE subs ADD COLUMN next TEXT']
+let grown = false
+async function grow(db) {
+  if (grown) return
+  for (const c of GROWN) { try { await db.prepare(c).run() } catch (e) {} }      // already there
+  grown = true
+}
 const DEVICES = 3                 // devices one account may sign in from in a calendar month
 const WAIT = 10                   // minutes a text may take to arrive
 const CHECKS = 8                  // lookups one sign-up may spend (the lookup service counts every call)
@@ -132,7 +142,7 @@ async function pay(db, member, plan, period, at = Date.now()) {
   await db.batch([
     db.prepare('INSERT INTO payments (member, plan, period, amount, coupon, at) VALUES (?, ?, ?, ?, ?, ?)').bind(member, plan, period, amount, held?.id ?? null, at),
     ...(held ? [db.prepare('UPDATE coupons SET used = ? WHERE id = ?').bind(at, held.id)] : []),
-    db.prepare("INSERT INTO subs (member, plan, period, started, since, ends, paid, state) VALUES (?, ?, ?, ?, ?, ?, ?, 'on') ON CONFLICT (member) DO UPDATE SET plan = excluded.plan, period = excluded.period, started = excluded.started, since = excluded.since, ends = excluded.ends, paid = excluded.paid, state = 'on'")
+    db.prepare("INSERT INTO subs (member, plan, period, started, since, ends, paid, state) VALUES (?, ?, ?, ?, ?, ?, ?, 'on') ON CONFLICT (member) DO UPDATE SET plan = excluded.plan, period = excluded.period, started = excluded.started, since = excluded.since, ends = excluded.ends, paid = excluded.paid, state = 'on', renew = 1, next = NULL")
       .bind(member, plan, period, going ? had.ends : opens(at), going ? had.since : opens(at), (going ? had.ends : opens(at)) + long, amount),
   ])
   return amount
@@ -140,11 +150,15 @@ async function pay(db, member, plan, period, at = Date.now()) {
 
 // Leaving: the unused days come back. A day is used once its eight o'clock has passed, so leaving before the first one returns everything.
 // A year bought at the yearly price is charged the monthly price for the days used.
+function owed(s, at = Date.now()) {
+  if (!s || s.ends <= at || !s.paid) return 0
+  const all = Math.round((s.ends - s.started) / DAY), used = at < s.started ? 0 : Math.min(all, Math.floor((at - s.started) / DAY) + 1)
+  return s.period === 'year' ? Math.max(0, s.paid - Math.round((PRICE[s.plan] || PRICE.all).month * 12 * used / 365)) : Math.max(0, Math.round(s.paid * (all - used) / all))
+}
 async function leave(db, member, at = Date.now()) {
   const s = await db.prepare("SELECT * FROM subs WHERE member = ? AND state = 'on'").bind(member).first()
   if (!s || s.ends <= at) return 0
-  const all = Math.round((s.ends - s.started) / DAY), used = at < s.started ? 0 : Math.min(all, Math.floor((at - s.started) / DAY) + 1)
-  const back = s.period === 'year' ? Math.max(0, s.paid - Math.round((PRICE[s.plan] || PRICE.all).month * 12 * used / 365)) : Math.max(0, Math.round(s.paid * (all - used) / all))
+  const back = owed(s, at)
   await db.prepare("UPDATE subs SET state = 'off', ends = ? WHERE member = ?").bind(at, member).run()
   return back
 }
@@ -153,7 +167,7 @@ async function card(db, m, env) {
   await ripen(db, m.id)
   const invited = await db.prepare('SELECT COUNT(*) AS n FROM members WHERE invited_by = ?').bind(m.id).first()
   const s = await live(db, m.id), held = !!await coupon(db, m.id)
-  return { early: before(env), first: await fresh(db, m.id) ? FIRST : 0, month: PRICE.all.month, phone: mask(m.phone), email: m.email, code: m.code, invited: invited.n, coupon: held, off: OFF, sub: s ? { plan: s.plan, period: s.period, from: s.since > Date.now() ? day(s.since) : null, ends: day(s.ends), next: due(s.plan, s.period, held) } : null, joined: new Date(Date.parse(m.joined) + 9 * 3600e3).toISOString().slice(0, 10) }
+  return { early: before(env), first: await fresh(db, m.id) ? FIRST : 0, month: PRICE.all.month, phone: mask(m.phone), email: m.email, code: m.code, invited: invited.n, coupon: held, off: OFF, sub: s ? { renew: s.renew !== 0, then: s.next || null, back: owed(s), paid: s.paid, plan: s.plan, period: s.period, from: s.since > Date.now() ? day(s.since) : null, ends: day(s.ends), next: due(s.plan, s.period, held) } : null, joined: new Date(Date.parse(m.joined) + 9 * 3600e3).toISOString().slice(0, 10) }
 }
 
 // Sign this device in and every other device out. Null when the month's devices are used up.
@@ -287,7 +301,8 @@ async function account(db, request) {
   if (!m) return reply({ ok: false, why: 'login' }, 401)
   const paid = await db.prepare('SELECT plan, period, amount, coupon, at FROM payments WHERE member = ? ORDER BY at DESC LIMIT 60').bind(m.id).all()
   const seen = await db.prepare('SELECT device FROM devices WHERE member = ? AND month = ?').bind(m.id, month()).all()
-  return reply({ ok: true, news: !!m.news, devices: seen.results.length, most: DEVICES, here: seen.results.some(r => r.device === cookies(request).fd),
+  const back = await db.prepare('SELECT amount, at, paid FROM refunds WHERE member = ? ORDER BY at DESC LIMIT 20').bind(m.id).all()
+  return reply({ ok: true, refunds: back.results.map(r => ({ day: day(r.at), amount: r.amount, paid: !!r.paid })), news: !!m.news, devices: seen.results.length, most: DEVICES, here: seen.results.some(r => r.device === cookies(request).fd),
     payments: paid.results.map(p => ({ day: day(p.at), plan: p.plan, period: p.period, amount: p.amount, coupon: !!p.coupon })) })
 }
 
@@ -329,6 +344,25 @@ async function renumber(env, db, request, got) {
   return reply({ ok: true, token, text, to: TO, minutes: WAIT, qr })
 }
 
+
+// What a member does with a subscription that was paid for: let it end with the days bought, take that back, end it today for the
+// unused days, or have the next payment buy a year. The money of a refund is sent back by the owner until a payment service does it.
+async function plan(db, request, got) {
+  const m = await who(db, request)
+  if (!m) return reply({ ok: false, why: 'login' }, 401)
+  const s = await live(db, m.id), what = String(got?.do || '')
+  if (!s || !s.paid) return reply({ ok: false, why: 'plan' }, 409)
+  if (await crowded(db, 'plan:' + m.id, 20, 60)) return reply({ ok: false, why: 'often' }, 429)
+  if (what === 'stop' || what === 'resume') await db.prepare('UPDATE subs SET renew = ?, next = CASE WHEN ? = 0 THEN NULL ELSE next END WHERE member = ?').bind(what === 'stop' ? 0 : 1, what === 'stop' ? 0 : 1, m.id).run()
+  else if (what === 'year' && s.period === 'month') await db.prepare("UPDATE subs SET next = 'year', renew = 1 WHERE member = ?").bind(m.id).run()
+  else if (what === 'month' && s.period === 'month') await db.prepare('UPDATE subs SET next = NULL WHERE member = ?').bind(m.id).run()
+  else if (what === 'end') {
+    const back = await leave(db, m.id)
+    if (back > 0) await db.prepare('INSERT INTO refunds (member, amount, at) VALUES (?, ?, ?)').bind(m.id, back, Date.now()).run()
+    return reply({ ok: true, back })
+  } else return reply({ ok: false }, 400)
+  return reply({ ok: true })
+}
 
 // What a subscriber may open today.
 async function orders(db, request, url, kind) {
@@ -403,6 +437,7 @@ export default {
     const db = env.DB
     try {
       await db.batch(TABLES.map(t => db.prepare(t)))
+      await grow(db)
       if (request.method === 'GET') {
         if (path === '/api/waitlist') return reply({ ok: true })
         if (path === '/api/me') { const m = await who(db, request); return reply({ ok: true, me: m ? await card(db, m, env) : null, open: !!env.OCTOMO_KEY || env.OCTOMO_TEST === '1' }) }
@@ -426,6 +461,7 @@ export default {
       if (path === '/api/login') return await login(env, db, request, got)
       if (path === '/api/quit') return await quit(db, request, got)
       if (path === '/api/password') return await password(db, request, got)
+      if (path === '/api/plan') return await plan(db, request, got)
       if (path === '/api/phone') return await renumber(env, db, request, got)
       if (path === '/api/news') {
         const m = await who(db, request)
