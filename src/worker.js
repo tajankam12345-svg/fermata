@@ -120,12 +120,14 @@ async function fresh(db, member, at = Date.now()) {
 }
 const live = (db, member) => db.prepare("SELECT * FROM subs WHERE member = ? AND state = 'on' AND ends > ?").bind(member, Date.now()).first()      // paid for; it may not have started yet
 
-// One coupon for an account, ever: a member who has had one, spent or not, gets nothing more.
+// One coupon of a kind for an account, ever: for the practice, and for an invitation (whichever side). Spent or not, no second of the kind.
 async function grant(db, member, why, at) {
-  if (await db.prepare('SELECT 1 FROM coupons WHERE member = ?').bind(member).first()) return
+  const kind = why === 'practice' ? "why = 'practice'" : "why IN ('invited', 'inviter')"
+  if (await db.prepare('SELECT 1 FROM coupons WHERE member = ? AND ' + kind).bind(member).first()) return false
   const m = await db.prepare('SELECT phone FROM members WHERE id = ?').bind(member).first()      // a number that left with a coupon does not earn another by joining again
-  if (!m || await db.prepare('SELECT 1 FROM spent WHERE mark = ? AND at > ?').bind(await sha('coupon:' + m.phone), at - 365 * DAY).first()) return
+  if (!m || await db.prepare('SELECT 1 FROM spent WHERE mark = ? AND at > ?').bind(await sha('coupon:' + m.phone), at - 365 * DAY).first()) return false
   await db.prepare('INSERT INTO coupons (member, why, made) VALUES (?, ?, ?)').bind(member, why, at).run()
+  return true
 }
 
 // An invited friend whose subscription has lasted a week earns a coupon for both, once.
@@ -184,7 +186,8 @@ async function card(db, m, env) {
   await ripen(db, m.id)
   const invited = await db.prepare('SELECT COUNT(*) AS n FROM members WHERE invited_by = ?').bind(m.id).first()
   const s = await live(db, m.id), held = !!await coupon(db, m.id)
-  return { early: before(env), first: await fresh(db, m.id) ? FIRST : 0, month: PRICE.all.month, phone: mask(m.phone), email: m.email, code: m.code, invited: invited.n, coupon: held, off: OFF, sub: s ? { deal: await dealt(db, m.id, s), renew: s.renew !== 0, then: s.next || null, back: owed(s), paid: s.paid, plan: s.plan, period: s.period, from: s.since > Date.now() ? day(s.since) : null, ends: day(s.ends), next: due(s.plan, s.period, held) } : null, joined: new Date(Date.parse(m.joined) + 9 * 3600e3).toISOString().slice(0, 10) }
+  const have = await db.prepare("SELECT COUNT(*) AS n FROM coupons WHERE member = ? AND used IS NULL AND why != 'early'").bind(m.id).first()
+  return { early: before(env), first: await fresh(db, m.id) ? FIRST : 0, month: PRICE.all.month, phone: mask(m.phone), email: m.email, code: m.code, invited: invited.n, coupon: held, coupons: have.n, off: OFF, sub: s ? { deal: await dealt(db, m.id, s), renew: s.renew !== 0, then: s.next || null, back: owed(s), paid: s.paid, plan: s.plan, period: s.period, from: s.since > Date.now() ? day(s.since) : null, ends: day(s.ends), next: due(s.plan, s.period, held) } : null, joined: new Date(Date.parse(m.joined) + 9 * 3600e3).toISOString().slice(0, 10) }
 }
 
 // Sign this device in and every other device out. Null when the month's devices are used up.
@@ -508,6 +511,11 @@ export default {
       if (path === '/api/login') return await login(env, db, request, got)
       if (path === '/api/quit') return await quit(db, request, got)
       if (path === '/api/password') return await password(db, request, got)
+      if (path === '/api/practice') {                                             // three orders placed right in a row on the practice screen: a coupon, once
+        const m = await who(db, request)
+        if (!m) return reply({ ok: false, why: 'login' }, 401)
+        return reply({ ok: true, got: await grant(db, m.id, 'practice', Date.now()) })
+      }
       if (path === '/api/plan') return await plan(db, request, got)
       if (path === '/api/phone') return await renumber(env, db, request, got)
       if (path === '/api/news') {
