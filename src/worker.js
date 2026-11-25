@@ -50,7 +50,7 @@ function cookies(request) {
   for (const part of (request.headers.get('cookie') || '').split(';')) { const k = part.indexOf('='); if (k > 0) out[part.slice(0, k).trim()] = part.slice(k + 1).trim() }
   return out
 }
-const bake = (name, value, age) => `${name}=${value}; Path=/; Max-Age=${age}; HttpOnly; Secure; SameSite=Lax`
+const bake = (name, value, age) => `${name}=${value}; Path=/; ${age == null ? '' : `Max-Age=${age}; `}HttpOnly; Secure; SameSite=Lax`      // no age: gone when the browser is closed
 
 function reply(body, status = 200, set = []) {
   const headers = new Headers({ 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
@@ -157,7 +157,7 @@ async function card(db, m, env) {
 }
 
 // Sign this device in and every other device out. Null when the month's devices are used up.
-async function enter(db, request, member) {
+async function enter(db, request, member, keep = true) {
   const had = cookies(request).fd, device = /^[0-9a-f]{32}$/.test(had || '') ? had : random(16), now = month()
   const seen = await db.prepare('SELECT device FROM devices WHERE member = ? AND month = ?').bind(member, now).all()
   const known = seen.results.some(r => r.device === device)
@@ -168,7 +168,7 @@ async function enter(db, request, member) {
     db.prepare('DELETE FROM sessions WHERE member = ?').bind(member),
     db.prepare('INSERT INTO sessions (token, member, device, made) VALUES (?, ?, ?, ?)').bind(await sha(token), member, device, Date.now()),
   ])
-  return [bake('fs', token, STAY), bake('fd', device, 365 * 86400)]
+  return [bake('fs', token, keep ? STAY : null), bake('fd', device, 365 * 86400)]
 }
 
 async function waitlist(db, got) {
@@ -256,7 +256,7 @@ async function login(env, db, request, got) {
   if (await crowded(db, 'login:' + phone, 10, 15)) return reply({ ok: false, why: 'often' }, 429)
   const m = await db.prepare('SELECT * FROM members WHERE phone = ?').bind(phone).first()
   if (!m || await lock(password.slice(0, 100), m.salt) !== m.hash) return reply({ ok: false, why: 'wrong' }, 401)
-  const set = await enter(db, request, m.id)
+  const set = await enter(db, request, m.id, got?.keep !== false)
   if (!set) return reply({ ok: false, why: 'devices' }, 403)
   return reply({ ok: true, me: await card(db, m, env) }, 200, set)
 }
@@ -268,7 +268,7 @@ async function quit(db, request, got) {
   if (await crowded(db, 'quit:' + m.id, 5, 15)) return reply({ ok: false, why: 'often' }, 429)
   if (await lock(String(got?.password || '').slice(0, 100), m.salt) !== m.hash) return reply({ ok: false, why: 'wrong' }, 401)
   const s = await live(db, m.id)
-  if (s && s.paid > 0) return reply({ ok: false, why: 'sub' }, 409)              // a paid subscription is ended first, so its refund is settled
+  if (s && got?.forfeit !== true) return reply({ ok: false, why: 'sub' }, 409)   // what is left of a subscription is given up without a refund, and only when the member says so
   const had = await db.prepare('SELECT 1 FROM coupons WHERE member = ?').bind(m.id).first(), paid = await db.prepare('SELECT 1 FROM payments WHERE member = ?').bind(m.id).first()
   await db.batch([
     ...(had ? [db.prepare('INSERT INTO spent (mark, at) VALUES (?, ?) ON CONFLICT (mark) DO UPDATE SET at = excluded.at').bind(await sha('coupon:' + m.phone), Date.now())] : []),
