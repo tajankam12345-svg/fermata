@@ -121,11 +121,17 @@ async function fresh(db, member, at = Date.now()) {
 const live = (db, member) => db.prepare("SELECT * FROM subs WHERE member = ? AND state = 'on' AND ends > ?").bind(member, Date.now()).first()      // paid for; it may not have started yet
 
 // One coupon of a kind for an account, ever: for the practice, and for an invitation (whichever side). Spent or not, no second of the kind.
+// What a leaving number keeps of its coupons: one mark for each kind it held (the coupons once given for joining early leave none).
+const kindOf = why => why === 'practice' ? 'practice' : why === 'invited' || why === 'inviter' ? 'invite' : null
+async function held(db, member, phone) {
+  const rows = await db.prepare('SELECT DISTINCT why FROM coupons WHERE member = ?').bind(member).all()
+  return Promise.all([...new Set(rows.results.map(r => kindOf(r.why)).filter(Boolean))].map(k => sha('coupon:' + k + ':' + phone)))
+}
 async function grant(db, member, why, at) {
   const kind = why === 'practice' ? "why = 'practice'" : "why IN ('invited', 'inviter')"
   if (await db.prepare('SELECT 1 FROM coupons WHERE member = ? AND ' + kind).bind(member).first()) return false
-  const m = await db.prepare('SELECT phone FROM members WHERE id = ?').bind(member).first()      // a number that left with a coupon does not earn another by joining again
-  if (!m || await db.prepare('SELECT 1 FROM spent WHERE mark = ? AND at > ?').bind(await sha('coupon:' + m.phone), at - 365 * DAY).first()) return false
+  const m = await db.prepare('SELECT phone FROM members WHERE id = ?').bind(member).first()      // a number that left with a coupon of this kind does not earn another by joining again
+  if (!m || await db.prepare('SELECT 1 FROM spent WHERE mark = ? AND at > ?').bind(await sha('coupon:' + kindOf(why) + ':' + m.phone), at - 365 * DAY).first()) return false
   await db.prepare('INSERT INTO coupons (member, why, made) VALUES (?, ?, ?)').bind(member, why, at).run()
   return true
 }
@@ -258,10 +264,10 @@ async function finish(env, db, request, got) {
   if (p.kind === 'phone') {                                                       // p.email holds the member whose number changes
     const m = await db.prepare('SELECT * FROM members WHERE id = ?').bind(Number(p.email)).first()
     if (!m || await db.prepare('SELECT 1 FROM members WHERE phone = ?').bind(p.phone).first()) return reply({ ok: false, why: 'taken' }, 409)
-    const had = await db.prepare('SELECT 1 FROM coupons WHERE member = ?').bind(m.id).first(), paid = await db.prepare('SELECT 1 FROM payments WHERE member = ?').bind(m.id).first()
+    const had = await held(db, m.id, m.phone), paid = await db.prepare('SELECT 1 FROM payments WHERE member = ?').bind(m.id).first()
     const note = k => db.prepare('INSERT INTO spent (mark, at) VALUES (?, ?) ON CONFLICT (mark) DO UPDATE SET at = excluded.at')
     await db.batch([                                                               // the number left behind keeps what it has used, so it cannot be used to start over
-      ...(had ? [note().bind(await sha('coupon:' + m.phone), Date.now())] : []), ...(paid ? [note().bind(await sha('first:' + m.phone), Date.now())] : []),
+      ...had.map(k => note().bind(k, Date.now())), ...(paid ? [note().bind(await sha('first:' + m.phone), Date.now())] : []),
       ...(await db.prepare('SELECT 1 FROM deals WHERE member = ?').bind(m.id).first() ? [note().bind(await sha('deal:' + m.phone), Date.now())] : []),
       db.prepare('UPDATE members SET phone = ? WHERE id = ?').bind(p.phone, m.id), db.prepare('DELETE FROM pending WHERE token = ?').bind(p.token),
     ])
@@ -304,12 +310,12 @@ async function quit(db, request, got) {
   if (await lock(String(got?.password || '').slice(0, 100), m.salt) !== m.hash) return reply({ ok: false, why: 'wrong' }, 401)
   const s = await live(db, m.id)
   if (s && got?.forfeit !== true) return reply({ ok: false, why: 'sub' }, 409)   // what is left of a subscription is given up without a refund, and only when the member says so
-  const had = await db.prepare('SELECT 1 FROM coupons WHERE member = ?').bind(m.id).first(), paid = await db.prepare('SELECT 1 FROM payments WHERE member = ?').bind(m.id).first()
+  const had = await held(db, m.id, m.phone), paid = await db.prepare('SELECT 1 FROM payments WHERE member = ?').bind(m.id).first()
   const dealt_ = await db.prepare('SELECT 1 FROM deals WHERE member = ?').bind(m.id).first()
   await db.batch([
     ...(dealt_ ? [db.prepare('INSERT INTO spent (mark, at) VALUES (?, ?) ON CONFLICT (mark) DO UPDATE SET at = excluded.at').bind(await sha('deal:' + m.phone), Date.now())] : []),
     db.prepare('UPDATE leaves SET member = NULL WHERE member = ?').bind(m.id),
-    ...(had ? [db.prepare('INSERT INTO spent (mark, at) VALUES (?, ?) ON CONFLICT (mark) DO UPDATE SET at = excluded.at').bind(await sha('coupon:' + m.phone), Date.now())] : []),
+    ...had.map(k => db.prepare('INSERT INTO spent (mark, at) VALUES (?, ?) ON CONFLICT (mark) DO UPDATE SET at = excluded.at').bind(k, Date.now())),
     ...(paid ? [db.prepare('INSERT INTO spent (mark, at) VALUES (?, ?) ON CONFLICT (mark) DO UPDATE SET at = excluded.at').bind(await sha('first:' + m.phone), Date.now())] : []),
     db.prepare('DELETE FROM spent WHERE at < ?').bind(Date.now() - 365 * DAY),
     ...['sessions', 'devices', 'coupons', 'oaths', 'subs', 'views', 'deals'].map(t => db.prepare(`DELETE FROM ${t} WHERE member = ?`).bind(m.id)),
@@ -514,7 +520,8 @@ export default {
       if (path === '/api/practice') {                                             // three orders placed right in a row on the practice screen: a coupon, once
         const m = await who(db, request)
         if (!m) return reply({ ok: false, why: 'login' }, 401)
-        return reply({ ok: true, got: await grant(db, m.id, 'practice', Date.now()) })
+        const got = await grant(db, m.id, 'practice', Date.now())
+        return reply({ ok: true, got, has: got || !!await db.prepare("SELECT 1 FROM coupons WHERE member = ? AND why = 'practice'").bind(m.id).first() })
       }
       if (path === '/api/plan') return await plan(db, request, got)
       if (path === '/api/phone') return await renumber(env, db, request, got)
