@@ -414,6 +414,10 @@ async function gift(env, db, request) {
   if (!PRICE[plan] || !(days >= 0 && days <= 3660)) return reply({ ok: false }, 400)
   const m = await db.prepare('SELECT id FROM members WHERE phone = ?').bind(phone).first()
   if (!m) return reply({ ok: false, why: 'unknown' }, 404)
+  if (got?.as === 'month' || got?.as === 'year') {                              // as if paid for, to try what a paying member sees: a payment is written down, no money moves
+    await db.prepare('DELETE FROM subs WHERE member = ?').bind(m.id).run()
+    return reply({ ok: true, plan, as: got.as, amount: await pay(db, m.id, plan, got.as) })
+  }
   const nine = eight(Date.now())                                                 // the last eight o'clock that has passed: open at once
   await db.prepare("INSERT INTO subs (member, plan, period, started, since, ends, paid, state) VALUES (?, ?, 'gift', ?, ?, ?, 0, ?) ON CONFLICT (member) DO UPDATE SET plan = excluded.plan, period = 'gift', started = excluded.started, since = excluded.since, ends = excluded.ends, paid = 0, state = excluded.state")
     .bind(m.id, plan, nine, nine, nine + days * DAY, days ? 'on' : 'off').run()
