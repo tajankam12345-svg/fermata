@@ -39,7 +39,7 @@ const FIRST = 9900                // an account's first month, once for a phone 
 // The one offer made to a member who is leaving for a reason other than the models or what they made: the next three months,
 // or the next year, at a lower price. Once for an account, shown or taken, and not again for the number after it leaves.
 const DEAL = { month: { price: 13900, times: 3 }, year: { price: 139000, times: 1 } }
-const SORE = ['model', 'returns']   // reasons no price answers
+
 const SEES = { all: ['LVX-B01', 'LVX-WH1', 'LVX-061', 'LVX-P32'], lyric: ['LVX-061'] }      // lyric: not sold any more
 const NAMES = { 'LVX-B01': 'Ode 2.2', 'LVX-WH1': 'Ode Encore 2.2', 'LVX-061': 'Lyric 2.2', 'LVX-P32': 'Rhapsody 2.2' }
 const OFF = 0.2                   // what a coupon takes off one monthly payment
@@ -383,13 +383,13 @@ async function plan(db, request, got) {
   const s = await live(db, m.id), what = String(got?.do || '')
   if (!s || !s.paid) return reply({ ok: false, why: 'plan' }, 409)
   if (await crowded(db, 'plan:' + m.id, 20, 60)) return reply({ ok: false, why: 'often' }, 429)
-  if (what === 'ask') {                                                          // why, before anything is done: the answer decides whether the one offer is made
+  if (what === 'ask') {                                                          // why, before anything is done: the one offer follows whatever the answer is
     const way = got?.way === 'end' ? 'end' : 'stop', reasons = (Array.isArray(got?.reasons) ? got.reasons : []).map(r => String(r).slice(0, 20)).slice(0, 10), note = String(got?.note || '').slice(0, 500)
     if (!reasons.length && !note.trim()) return reply({ ok: false, why: 'reason' }, 400)
     const kind = s.period === 'year' ? 'year' : 'month'
-    const sore = reasons.some(r => SORE.includes(r)), had = await db.prepare('SELECT 1 FROM deals WHERE member = ?').bind(m.id).first()
+    const had = await db.prepare('SELECT 1 FROM deals WHERE member = ?').bind(m.id).first()
     const gone = await db.prepare('SELECT 1 FROM spent WHERE mark = ? AND at > ?').bind(await sha('deal:' + m.phone), Date.now() - 365 * DAY).first()
-    const offer = !sore && !had && !gone && (s.period === 'month' || s.period === 'year')
+    const offer = !had && !gone && (s.period === 'month' || s.period === 'year')
     await db.batch([
       db.prepare('INSERT INTO leaves (member, period, way, reasons, note, offered, at) VALUES (?, ?, ?, ?, ?, ?, ?)').bind(m.id, s.period, way, reasons.join(','), note, offer ? 1 : 0, Date.now()),
       ...(offer ? [db.prepare('INSERT INTO deals (member, kind, at) VALUES (?, ?, ?)').bind(m.id, kind, Date.now())] : []),      // shown is used: there is no second showing
