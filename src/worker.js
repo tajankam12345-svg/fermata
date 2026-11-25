@@ -37,6 +37,7 @@ const sha = async s => hex(await crypto.subtle.digest('SHA-256', new TextEncoder
 const digits = n => [...crypto.getRandomValues(new Uint32Array(n))].map(x => x % 10).join('')
 const letters = n => [...crypto.getRandomValues(new Uint32Array(n))].map(x => 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[x % 32]).join('')
 const month = () => new Date(Date.now() + 9 * 3600e3).toISOString().slice(0, 7)          // Korean time
+const weak = password => password.length < 9 || password.length > 100 || !/[A-Za-z]/.test(password) || !/\d/.test(password) || !/[^A-Za-z0-9]/.test(password)      // letters, digits and a sign, nine or more
 const mask = p => p.slice(0, 3) + '-****-' + p.slice(7)
 
 async function lock(password, salt) {
@@ -184,7 +185,7 @@ async function begin(env, db, got, kind) {
   if (got?.site) return reply({ ok: false, why: 'phone' }, 400)
   const phone = String(got?.phone || '').replace(/\D/g, ''), email = String(got?.email || '').trim().toLowerCase(), password = String(got?.password || '')
   if (!PHONE.test(phone)) return reply({ ok: false, why: 'phone' }, 400)
-  if (password.length < 9 || password.length > 100 || !/[A-Za-z]/.test(password) || !/\d/.test(password) || !/[^A-Za-z0-9]/.test(password)) return reply({ ok: false, why: 'password' }, 400)      // letters, digits and a sign, nine or more
+  if (weak(password)) return reply({ ok: false, why: 'password' }, 400)
   const member = await db.prepare('SELECT id FROM members WHERE phone = ?').bind(phone).first()
   let invited = null
   if (kind === 'join') {
@@ -220,6 +221,17 @@ async function finish(env, db, request, got) {
   await db.prepare('UPDATE pending SET checks = checks + 1 WHERE token = ?').bind(p.token).run()
   if (!await texted(env, p.phone, p.text)) return reply({ ok: true, done: false })
   let id
+  if (p.kind === 'phone') {                                                       // p.email holds the member whose number changes
+    const m = await db.prepare('SELECT * FROM members WHERE id = ?').bind(Number(p.email)).first()
+    if (!m || await db.prepare('SELECT 1 FROM members WHERE phone = ?').bind(p.phone).first()) return reply({ ok: false, why: 'taken' }, 409)
+    const had = await db.prepare('SELECT 1 FROM coupons WHERE member = ?').bind(m.id).first(), paid = await db.prepare('SELECT 1 FROM payments WHERE member = ?').bind(m.id).first()
+    const note = k => db.prepare('INSERT INTO spent (mark, at) VALUES (?, ?) ON CONFLICT (mark) DO UPDATE SET at = excluded.at')
+    await db.batch([                                                               // the number left behind keeps what it has used, so it cannot be used to start over
+      ...(had ? [note().bind(await sha('coupon:' + m.phone), Date.now())] : []), ...(paid ? [note().bind(await sha('first:' + m.phone), Date.now())] : []),
+      db.prepare('UPDATE members SET phone = ? WHERE id = ?').bind(p.phone, m.id), db.prepare('DELETE FROM pending WHERE token = ?').bind(p.token),
+    ])
+    return reply({ ok: true, done: true, me: await card(db, { ...m, phone: p.phone }, env) })
+  }
   if (p.kind === 'join') {
     for (let k = 0; k < 5 && id == null; k++) {
       const made = await db.prepare('INSERT OR IGNORE INTO members (phone, email, salt, hash, joined, code, invited_by, news, place) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
@@ -269,6 +281,55 @@ async function quit(db, request, got) {
   return reply({ ok: true }, 200, [bake('fs', '', 0)])
 }
 
+// What the account page shows beside the card: payments, this month's devices, whether news is wanted.
+async function account(db, request) {
+  const m = await who(db, request)
+  if (!m) return reply({ ok: false, why: 'login' }, 401)
+  const paid = await db.prepare('SELECT plan, period, amount, coupon, at FROM payments WHERE member = ? ORDER BY at DESC LIMIT 60').bind(m.id).all()
+  const seen = await db.prepare('SELECT device FROM devices WHERE member = ? AND month = ?').bind(m.id, month()).all()
+  return reply({ ok: true, news: !!m.news, devices: seen.results.length, most: DEVICES, here: seen.results.some(r => r.device === cookies(request).fd),
+    payments: paid.results.map(p => ({ day: day(p.at), plan: p.plan, period: p.period, amount: p.amount, coupon: !!p.coupon })) })
+}
+
+// A new password, by one who knows the old one. Every other device is signed out.
+async function password(db, request, got) {
+  const m = await who(db, request)
+  if (!m) return reply({ ok: false, why: 'login' }, 401)
+  if (await crowded(db, 'word:' + m.id, 5, 15)) return reply({ ok: false, why: 'often' }, 429)
+  if (await lock(String(got?.password || '').slice(0, 100), m.salt) !== m.hash) return reply({ ok: false, why: 'wrong' }, 401)
+  const next = String(got?.next || '')
+  if (weak(next)) return reply({ ok: false, why: 'password' }, 400)
+  const salt = random(16), mine = cookies(request).fs
+  await db.batch([
+    db.prepare('UPDATE members SET salt = ?, hash = ? WHERE id = ?').bind(salt, await lock(next, salt), m.id),
+    db.prepare('DELETE FROM sessions WHERE member = ? AND token != ?').bind(m.id, await sha(mine)),
+  ])
+  return reply({ ok: true })
+}
+
+// A new number: the member gives the password, then texts from the new phone as a new member would.
+async function renumber(env, db, request, got) {
+  if (!env.OCTOMO_KEY && env.OCTOMO_TEST !== '1') return reply({ ok: false, why: 'closed' }, 503)
+  const m = await who(db, request)
+  if (!m) return reply({ ok: false, why: 'login' }, 401)
+  const phone = String(got?.phone || '').replace(/\D/g, '')
+  if (!PHONE.test(phone) || phone === m.phone) return reply({ ok: false, why: 'phone' }, 400)
+  if (await crowded(db, 'begin:' + phone, 5, 60) || await crowded(db, 'word:' + m.id, 5, 15)) return reply({ ok: false, why: 'often' }, 429)
+  if (await lock(String(got?.password || '').slice(0, 100), m.salt) !== m.hash) return reply({ ok: false, why: 'wrong' }, 401)
+  if (await db.prepare('SELECT 1 FROM members WHERE phone = ?').bind(phone).first()) return reply({ ok: false, why: 'taken' }, 409)
+  const token = random(24), text = digits(6)
+  await db.prepare('INSERT INTO pending (token, kind, phone, email, salt, hash, text, made) VALUES (?, ?, ?, ?, ?, ?, ?, ?)').bind(token, 'phone', phone, String(m.id), '', '', text, Date.now()).run()
+  let qr = null
+  if (env.OCTOMO_KEY) {
+    try {
+      const r = await fetch(OCTOMO.replace('/exists', '/qr-code'), { method: 'POST', headers: { accept: 'application/json', 'content-type': 'application/json', authorization: 'Octomo ' + env.OCTOMO_KEY }, body: JSON.stringify({ text, width: 320 }) })
+      if (r.ok) qr = (await r.json()).qrCode || null
+    } catch (e) {}
+  }
+  return reply({ ok: true, token, text, to: TO, minutes: WAIT, qr })
+}
+
+
 // What a subscriber may open today.
 async function orders(db, request, url, kind) {
   const m = await who(db, request)
@@ -283,6 +344,11 @@ async function orders(db, request, url, kind) {
   if (!sworn) return reply({ ok: false, why: 'oath' }, 403)
   const model = url.searchParams.get('model')
   if (!models.includes(model)) return reply({ ok: false }, 404)
+  if (kind === 'sheet') {                                                        // the rows themselves, with the member's own number and address to lay across them
+    const row = await db.prepare('SELECT body FROM feed WHERE day = ? AND model = ?').bind(last.day, model).first()
+    await db.prepare('INSERT INTO views (member, day, model, device, at) VALUES (?, ?, ?, ?, ?)').bind(m.id, last.day, model, cookies(request).fd || null, Date.now()).run()
+    return reply({ ok: true, day: last.day, model, name: NAMES[model], ...JSON.parse(row.body), mark: m.phone.replace(/(\d{3})(\d{4})(\d{4})/, '$1-$2-$3') + '  ' + m.email })
+  }
   const row = await db.prepare('SELECT body FROM feed WHERE day = ? AND model = ?').bind(last.day, model).first()
   await db.prepare('INSERT INTO views (member, day, model, device, at) VALUES (?, ?, ?, ?, ?)').bind(m.id, last.day, model, cookies(request).fd || null, Date.now()).run()
   const mark = m.phone.replace(/(\d{3})(\d{4})(\d{4})/, '$1-$2-$3') + ' ' + m.email
@@ -342,6 +408,8 @@ export default {
         if (path === '/api/me') { const m = await who(db, request); return reply({ ok: true, me: m ? await card(db, m, env) : null, open: !!env.OCTOMO_KEY || env.OCTOMO_TEST === '1' }) }
         if (path === '/api/orders') return await orders(db, request, url, 'list')
         if (path === '/api/orders.png') return await orders(db, request, url, 'picture')
+        if (path === '/api/sheet') return await orders(db, request, url, 'sheet')
+        if (path === '/api/account') return await account(db, request)
         return reply({ ok: false }, 404)
       }
       if (request.method !== 'POST') return reply({ ok: false }, 405)
@@ -357,6 +425,14 @@ export default {
       if (path === '/api/check') return await finish(env, db, request, got)
       if (path === '/api/login') return await login(env, db, request, got)
       if (path === '/api/quit') return await quit(db, request, got)
+      if (path === '/api/password') return await password(db, request, got)
+      if (path === '/api/phone') return await renumber(env, db, request, got)
+      if (path === '/api/news') {
+        const m = await who(db, request)
+        if (!m) return reply({ ok: false, why: 'login' }, 401)
+        await db.prepare('UPDATE members SET news = ? WHERE id = ?').bind(got?.news === true ? 1 : 0, m.id).run()
+        return reply({ ok: true, news: got?.news === true })
+      }
       if (path === '/api/oath') {
         const m = await who(db, request)
         if (!m) return reply({ ok: false, why: 'login' }, 401)
