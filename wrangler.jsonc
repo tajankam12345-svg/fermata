@@ -2,7 +2,7 @@
   "name": "fermata",
   "main": "src/worker.js",
   "compatibility_date": "2025-09-01",
-  "assets": { "directory": "./public", "binding": "ASSETS" },
+  "assets": { "directory": "./public", "binding": "ASSETS", "run_worker_first": true },
   // LAUNCH: the moment subscriptions open, like "2027-01-05T09:00:00+09:00". Empty until then: everyone who joins gets a coupon.
   "vars": { "LAUNCH": "" },
   "keep_vars": true,

@@ -1,0 +1,11 @@
+User-agent: *
+Allow: /
+Disallow: /api/
+Disallow: /join
+Disallow: /login
+Disallow: /reset
+Disallow: /me
+Disallow: /today
+Disallow: /orders
+
+Sitemap: https://fermatainvest.com/sitemap.xml

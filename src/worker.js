@@ -385,7 +385,6 @@ async function plan(db, request, got) {
   if (await crowded(db, 'plan:' + m.id, 20, 60)) return reply({ ok: false, why: 'often' }, 429)
   if (what === 'ask') {                                                          // why, before anything is done: the one offer follows whatever the answer is
     const way = got?.way === 'end' ? 'end' : 'stop', reasons = (Array.isArray(got?.reasons) ? got.reasons : []).map(r => String(r).slice(0, 20)).slice(0, 10), note = String(got?.note || '').slice(0, 500)
-    if (!reasons.length && !note.trim()) return reply({ ok: false, why: 'reason' }, 400)
     const kind = s.period === 'year' ? 'year' : 'month'
     const had = await db.prepare('SELECT 1 FROM deals WHERE member = ?').bind(m.id).first()
     const gone = await db.prepare('SELECT 1 FROM spent WHERE mark = ? AND at > ?').bind(await sha('deal:' + m.phone), Date.now() - 365 * DAY).first()
@@ -489,7 +488,14 @@ async function pretend(db, request, path, got) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url), path = url.pathname
-    if (!path.startsWith('/api/')) return env.ASSETS.fetch(request)
+    if (!path.startsWith('/api/')) {
+      if (url.hostname === 'www.fermatainvest.com' || url.hostname === 'fermatainvest.com' && url.protocol === 'http:') return Response.redirect('https://fermatainvest.com' + path + url.search, 301)      // one address for every page
+      const r = await env.ASSETS.fetch(request)
+      if (r.status !== 404 || /\.[a-z0-9]+$/i.test(path)) return r
+      const app = await env.ASSETS.fetch(new Request(new URL('/', url), { headers: request.headers }))      // a page with no file of its own: the app draws it
+      const h = new Headers(app.headers); h.set('x-robots-tag', 'noindex')
+      return new Response(app.body, { status: 200, headers: h })
+    }
     const db = env.DB
     try {
       await db.batch(TABLES.map(t => db.prepare(t)))
