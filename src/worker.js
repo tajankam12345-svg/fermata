@@ -30,7 +30,6 @@ async function grow(db) {
   for (const c of GROWN) { try { await db.prepare(c).run() } catch (e) {} }      // already there
   grown = true
 }
-const DEVICES = 3                 // devices one account may sign in from in a calendar month
 const WAIT = 10                   // minutes a text may take to arrive
 const CHECKS = 8                  // lookups one sign-up may spend (the lookup service counts every call)
 const STAY = 30 * 86400           // seconds a sign-in lasts
@@ -196,13 +195,11 @@ async function card(db, m, env) {
   return { early: before(env), first: await fresh(db, m.id) ? FIRST : 0, month: PRICE.all.month, phone: mask(m.phone), email: m.email, code: m.code, invited: invited.n, coupon: held, coupons: have.n, off: OFF, sub: s ? { deal: await dealt(db, m.id, s), renew: s.renew !== 0, then: s.next || null, back: owed(s), paid: s.paid, plan: s.plan, period: s.period, from: s.since > Date.now() ? day(s.since) : null, ends: day(s.ends), next: due(s.plan, s.period, held) } : null, joined: new Date(Date.parse(m.joined) + 9 * 3600e3).toISOString().slice(0, 10) }
 }
 
-// Sign this device in and every other device out. Null when the month's devices are used up.
+// Sign this device in and every other device out: one account is signed in on one device at a time.
 async function enter(db, request, member, keep = true) {
   const had = cookies(request).fd, device = /^[0-9a-f]{32}$/.test(had || '') ? had : random(16), now = month()
   const seen = await db.prepare('SELECT device FROM devices WHERE member = ? AND month = ?').bind(member, now).all()
-  const known = seen.results.some(r => r.device === device)
-  if (!known && seen.results.length >= DEVICES) return null
-  if (!known) await db.prepare('INSERT INTO devices (member, device, month) VALUES (?, ?, ?)').bind(member, device, now).run()
+  if (!seen.results.some(r => r.device === device)) await db.prepare('INSERT INTO devices (member, device, month) VALUES (?, ?, ?)').bind(member, device, now).run()
   const token = random(32)
   await db.batch([
     db.prepare('DELETE FROM sessions WHERE member = ?').bind(member),
@@ -287,7 +284,6 @@ async function finish(env, db, request, got) {
   }
   await db.prepare('DELETE FROM pending WHERE token = ?').bind(p.token).run()
   const set = await enter(db, request, id)
-  if (!set) return reply({ ok: true, done: true, why: 'devices' })              // the password is changed; this device cannot come in this month
   return reply({ ok: true, done: true, me: await card(db, await db.prepare('SELECT * FROM members WHERE id = ?').bind(id).first(), env) }, 200, set)
 }
 
@@ -298,7 +294,6 @@ async function login(env, db, request, got) {
   const m = await db.prepare('SELECT * FROM members WHERE phone = ?').bind(phone).first()
   if (!m || await lock(password.slice(0, 100), m.salt) !== m.hash) return reply({ ok: false, why: 'wrong' }, 401)
   const set = await enter(db, request, m.id, got?.keep !== false)
-  if (!set) return reply({ ok: false, why: 'devices' }, 403)
   return reply({ ok: true, me: await card(db, m, env) }, 200, set)
 }
 
@@ -325,14 +320,13 @@ async function quit(db, request, got) {
   return reply({ ok: true }, 200, [bake('fs', '', 0)])
 }
 
-// What the account page shows beside the card: payments, this month's devices, whether news is wanted.
+// What the account page shows beside the card: payments, whether news is wanted.
 async function account(db, request) {
   const m = await who(db, request)
   if (!m) return reply({ ok: false, why: 'login' }, 401)
   const paid = await db.prepare('SELECT plan, period, amount, coupon, at FROM payments WHERE member = ? ORDER BY at DESC LIMIT 60').bind(m.id).all()
-  const seen = await db.prepare('SELECT device FROM devices WHERE member = ? AND month = ?').bind(m.id, month()).all()
   const back = await db.prepare('SELECT amount, at, paid FROM refunds WHERE member = ? ORDER BY at DESC LIMIT 20').bind(m.id).all()
-  return reply({ ok: true, refunds: back.results.map(r => ({ day: day(r.at), amount: r.amount, paid: !!r.paid })), news: !!m.news, devices: seen.results.length, most: DEVICES, here: seen.results.some(r => r.device === cookies(request).fd),
+  return reply({ ok: true, refunds: back.results.map(r => ({ day: day(r.at), amount: r.amount, paid: !!r.paid })), news: !!m.news,
     payments: paid.results.map(p => ({ day: day(p.at), plan: p.plan, period: p.period, amount: p.amount, coupon: !!p.coupon })) })
 }
 
@@ -508,6 +502,7 @@ export default {
           const a = read(rows[0]), b = read(rows[1])
           return reply({ ok: true, today: a ? { day: rows[0].day, buy: (a.buy || []).length, sell: (a.sell || []).length } : null, was: b ? { day: rows[1].day, buy: names(b.buy), sell: names(b.sell) } : null })
         }
+        if (path === '/api/alive') return reply({ ok: true, here: !!await who(db, request) })      // asked often by a signed-in page: is this device still the one signed in
         if (path === '/api/me') { const m = await who(db, request); return reply({ ok: true, me: m ? await card(db, m, env) : null, open: !!env.OCTOMO_KEY || env.OCTOMO_TEST === '1' }) }
         if (path === '/api/orders') return await orders(db, request, url, 'list')
         if (path === '/api/orders.png') return await orders(db, request, url, 'picture')
