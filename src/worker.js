@@ -23,7 +23,7 @@ const TABLES = [
 const OCTOMO = 'https://api.octoverse.kr/octomo/v1/public/message/exists', TO = '16663538'
 // Columns added after the first tables were made. renew: 0 when the member has said the subscription ends with what is paid for.
 // next: the period the next payment buys when it is not the same again ('year' after a month).
-const GROWN = ['ALTER TABLE subs ADD COLUMN renew INTEGER NOT NULL DEFAULT 1', 'ALTER TABLE subs ADD COLUMN next TEXT']
+const GROWN = ['ALTER TABLE subs ADD COLUMN renew INTEGER NOT NULL DEFAULT 1', 'ALTER TABLE subs ADD COLUMN next TEXT', 'ALTER TABLE members ADD COLUMN main TEXT']
 let grown = false
 async function grow(db) {
   if (grown) return
@@ -419,7 +419,7 @@ async function orders(db, request, url, kind) {
   const last = await db.prepare('SELECT MAX(day) AS day FROM feed WHERE day <= ?').bind(shown()).first()      // nothing shows before its eight o'clock
   const rows = last.day ? (await db.prepare('SELECT model FROM feed WHERE day = ?').bind(last.day).all()).results.map(r => r.model) : []
   const models = SEES[s.plan].filter(n => rows.includes(n))
-  if (kind === 'list') return reply({ ok: true, first: Date.now() < s.since + DAY, since: day(s.since), day: last.day, models: models.map(n => ({ id: n, name: NAMES[n] })), sworn, mark: mask(m.phone) })
+  if (kind === 'list') return reply({ ok: true, first: Date.now() < s.since + DAY, since: day(s.since), day: last.day, models: models.map(n => ({ id: n, name: NAMES[n] })), main: models.includes(m.main) ? m.main : null, sworn, mark: mask(m.phone) })
   if (!sworn) return reply({ ok: false, why: 'oath' }, 403)
   const model = url.searchParams.get('model')
   if (!models.includes(model)) return reply({ ok: false }, 404)
@@ -443,7 +443,7 @@ async function feed(env, db, request) {
   const list = v => Array.isArray(v) && v.length <= 200 && v.every(r => Array.isArray(r) && /^[A-Z0-9.\-]{1,10}$/.test(r[0]) && Number.isFinite(r[1]))
   if (!/^\d{4}-\d{2}-\d{2}$/.test(got?.day || '') || !NAMES[got?.model] || !['buy', 'sell', 'hold'].every(k => list(got[k] || []))) return reply({ ok: false }, 400)
   await db.batch([
-    db.prepare('INSERT INTO feed (day, model, body) VALUES (?, ?, ?) ON CONFLICT (day, model) DO UPDATE SET body = excluded.body').bind(got.day, got.model, JSON.stringify({ buy: got.buy || [], sell: got.sell || [], hold: got.hold || [] })),
+    db.prepare('INSERT INTO feed (day, model, body) VALUES (?, ?, ?) ON CONFLICT (day, model) DO UPDATE SET body = excluded.body').bind(got.day, got.model, JSON.stringify({ buy: got.buy || [], sell: got.sell || [], hold: got.hold || [], guard: got.guard === true, turn: ['guard', 'back'].includes(got.turn) ? got.turn : null })),
     db.prepare('DELETE FROM feed WHERE day < ?').bind(day(Date.now() - 14 * DAY)),
   ])
   return reply({ ok: true })
@@ -551,6 +551,13 @@ export default {
       }
       if (path === '/api/plan') return await plan(db, request, got)
       if (path === '/api/phone') return await renumber(env, db, request, got)
+      if (path === '/api/main') {                                                 // the model the member's orders page opens on
+        const m = await who(db, request)
+        if (!m) return reply({ ok: false, why: 'login' }, 401)
+        const main = NAMES[got?.model] ? got.model : null
+        await db.prepare('UPDATE members SET main = ? WHERE id = ?').bind(main, m.id).run()
+        return reply({ ok: true, main })
+      }
       if (path === '/api/news') {
         const m = await who(db, request)
         if (!m) return reply({ ok: false, why: 'login' }, 401)
