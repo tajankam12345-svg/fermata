@@ -451,6 +451,23 @@ async function feed(env, db, request) {
 
 // The owner opens a subscription for a member without a payment: for the owner's own account, a reviewer, a guest.
 // It is open at once, costs nothing, and takes no coupon. Zero days closes it.
+// Counts for the one who runs the site: how many joined, subscribe, opened the orders. Numbers only, no member's details.
+async function stats(env, db, request) {
+  if (!env.FEED_KEY) return reply({ ok: false }, 503)
+  if (request.headers.get('authorization') !== 'Feed ' + env.FEED_KEY) return reply({ ok: false }, 401)
+  const now = Date.now(), ago = d => new Date(now - d * 86400e3).toISOString(), one = async (q, ...a) => (await db.prepare(q).bind(...a).first()).n
+  return reply({ ok: true,
+    members: await one('SELECT COUNT(*) n FROM members'), joined_1: await one('SELECT COUNT(*) n FROM members WHERE joined > ?', ago(1)), joined_7: await one('SELECT COUNT(*) n FROM members WHERE joined > ?', ago(7)),
+    invited: await one('SELECT COUNT(*) n FROM members WHERE invited_by IS NOT NULL'),
+    waitlist: await one('SELECT COUNT(*) n FROM waitlist'), unfinished: await one('SELECT COUNT(*) n FROM pending WHERE kind = ?', 'join'),
+    subs: await one('SELECT COUNT(*) n FROM subs WHERE ends > ?', now), paying: await one('SELECT COUNT(*) n FROM subs WHERE ends > ? AND paid > 0', now),
+    paid_30: await one('SELECT COALESCE(SUM(amount), 0) n FROM payments WHERE at > ?', now - 30 * 86400e3),
+    coupons: await one('SELECT COUNT(*) n FROM coupons'), practice: await one("SELECT COUNT(*) n FROM coupons WHERE why = 'practice'"),
+    signed_in_7: await one('SELECT COUNT(DISTINCT member) n FROM sessions WHERE made > ?', now - 7 * 86400e3),
+    readers_1: await one('SELECT COUNT(DISTINCT member) n FROM views WHERE at > ?', now - 86400e3), readers_7: await one('SELECT COUNT(DISTINCT member) n FROM views WHERE at > ?', now - 7 * 86400e3),
+    leaves: await one('SELECT COUNT(*) n FROM leaves') })
+}
+
 async function gift(env, db, request) {
   if (!env.FEED_KEY) return reply({ ok: false }, 503)
   if (request.headers.get('authorization') !== 'Feed ' + env.FEED_KEY) return reply({ ok: false }, 401)
@@ -515,6 +532,7 @@ export default {
       if (origin && origin !== url.origin) return reply({ ok: false }, 403)
       if (path === '/api/feed') return await feed(env, db, request)
       if (path === '/api/gift') return await gift(env, db, request)
+      if (path === '/api/stats') return await stats(env, db, request)
       if (Number(request.headers.get('content-length') || 0) > 2000) return reply({ ok: false }, 413)
       const got = await request.json().catch(() => null)
       if (path === '/api/waitlist') return await waitlist(db, got)
