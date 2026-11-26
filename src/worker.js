@@ -502,6 +502,12 @@ export default {
       await grow(db)
       if (request.method === 'GET') {
         if (path === '/api/waitlist') return reply({ ok: true })
+        if (path === '/api/yesterday') {                                          // Ode's sheet before the latest, names only, for anyone; of the latest, only how many orders
+          const rows = (await db.prepare("SELECT day, body FROM feed WHERE model = 'LVX-B01' AND day <= ? ORDER BY day DESC LIMIT 2").bind(shown()).all()).results
+          const read = r => r ? JSON.parse(r.body) : null, names = l => (l || []).map(x => String(x[0]))
+          const a = read(rows[0]), b = read(rows[1])
+          return reply({ ok: true, today: a ? { day: rows[0].day, buy: (a.buy || []).length, sell: (a.sell || []).length } : null, was: b ? { day: rows[1].day, buy: names(b.buy), sell: names(b.sell) } : null })
+        }
         if (path === '/api/me') { const m = await who(db, request); return reply({ ok: true, me: m ? await card(db, m, env) : null, open: !!env.OCTOMO_KEY || env.OCTOMO_TEST === '1' }) }
         if (path === '/api/orders') return await orders(db, request, url, 'list')
         if (path === '/api/orders.png') return await orders(db, request, url, 'picture')
